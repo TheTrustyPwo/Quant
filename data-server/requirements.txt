@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+duckdb
+pydantic
+httpx
+pandas
+python-dotenv
+binance-common
+binance-sdk-derivatives-trading-usds-futures
+websockets
+tqdm

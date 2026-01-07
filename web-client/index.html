@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1"
+    />
+    <title>Market Data Charts</title>
+    <link rel="stylesheet" href="style.css" />
+    <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+  </head>
+  <body>
+    <header>
+      <div class="controls">
+        <label>
+          Symbol
+          <input id="symbol" value="SOLUSDT" />
+        </label>
+        <label>
+          Timeframe
+          <input id="timeframe" value="1m" />
+        </label>
+        <label>
+          Snapshot
+          <input id="snapshot" type="number" value="200" min="10" max="2000" />
+        </label>
+        <label>
+          WS URL
+          <input id="ws-url" value="" />
+        </label>
+        <button id="connect">Connect</button>
+        <button id="disconnect" disabled>Disconnect</button>
+        <span id="status">Disconnected</span>
+      </div>
+    </header>
+
+    <main>
+      <section>
+        <h2>Price</h2>
+        <div id="price-chart" class="chart"></div>
+      </section>
+      <section>
+        <h2>CVD</h2>
+        <div id="cvd-chart" class="chart"></div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

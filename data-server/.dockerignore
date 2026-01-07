@@ -1,0 +1,6 @@
+# Ignore local data volumes
+/data/
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+*.zip
