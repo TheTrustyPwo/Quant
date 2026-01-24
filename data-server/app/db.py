@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from typing import Iterable, Generator
 
 import duckdb
+import numpy as np
 import pandas as pd
 
 from app.config import DUCKDB_PATH
@@ -145,25 +146,69 @@ def checkpoint_db() -> None:
         logger.warning("Checkpoint skipped - could not acquire lock")
 
 
+# Optimal dtypes for agg_trades table (used for efficient insertion)
+_AGG_TRADES_DTYPES = {
+    "symbol": "object",
+    "trade_id": "int64",
+    "price": "float64",
+    "qty": "float64",
+    "ts_ms": "int64",
+    "is_buyer_maker": "bool",
+}
+
+
 def insert_agg_trades(trades: list[AggTrade] | pd.DataFrame) -> int:
-    """Insert aggregated trades into the database."""
+    """Insert aggregated trades into the database.
+
+    Optimized with:
+    - NumPy array construction (faster than list comprehensions)
+    - Explicit dtypes for efficient DuckDB insertion
+    """
     if trades is None:
         return 0
+
     if isinstance(trades, pd.DataFrame):
         df = trades
+        # Ensure correct dtypes for efficient insertion
+        if not df.empty:
+            for col, dtype in _AGG_TRADES_DTYPES.items():
+                if col in df.columns and df[col].dtype != dtype:
+                    df[col] = df[col].astype(dtype)
     else:
         if not trades:
             return 0
+
+        # Use numpy arrays directly (much faster than list comprehensions for large lists)
+        n = len(trades)
+
+        # Pre-allocate arrays
+        symbols = np.empty(n, dtype=object)
+        trade_ids = np.empty(n, dtype=np.int64)
+        prices = np.empty(n, dtype=np.float64)
+        qtys = np.empty(n, dtype=np.float64)
+        ts_ms_arr = np.empty(n, dtype=np.int64)
+        is_buyer_maker_arr = np.empty(n, dtype=np.bool_)
+
+        # Fill arrays (faster than list comprehension + DataFrame constructor)
+        for i, t in enumerate(trades):
+            symbols[i] = t.symbol
+            trade_ids[i] = t.trade_id
+            prices[i] = t.price
+            qtys[i] = t.qty
+            ts_ms_arr[i] = t.ts_ms
+            is_buyer_maker_arr[i] = t.is_buyer_maker
+
         df = pd.DataFrame(
             {
-                "symbol": [t.symbol for t in trades],
-                "trade_id": [t.trade_id for t in trades],
-                "price": [t.price for t in trades],
-                "qty": [t.qty for t in trades],
-                "ts_ms": [t.ts_ms for t in trades],
-                "is_buyer_maker": [t.is_buyer_maker for t in trades],
+                "symbol": symbols,
+                "trade_id": trade_ids,
+                "price": prices,
+                "qty": qtys,
+                "ts_ms": ts_ms_arr,
+                "is_buyer_maker": is_buyer_maker_arr,
             }
         )
+
     if df.empty:
         return 0
 

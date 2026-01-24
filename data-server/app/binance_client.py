@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, AsyncGenerator
 
 import httpx
+import numpy as np
 import pandas as pd
 import websockets
 from tqdm import tqdm
@@ -272,55 +273,206 @@ def download_vision_aggtrades_day(symbol: str, year: int, month: int, day: int, 
     return _download_file(url, dest_path)
 
 
+# ============================================================================
+# Optimized Vision ZIP loading with numpy acceleration
+# ============================================================================
+
+# Column name mappings for Vision CSV files (computed once)
+_VISION_RENAME_MAP = {
+    "agg_trade_id": "trade_id",
+    "aggTradeId": "trade_id",
+    "quantity": "qty",
+    "qty": "qty",
+    "transact_time": "ts_ms",
+    "timestamp": "ts_ms",
+    "is_buyer_maker": "is_buyer_maker",
+    "isBuyerMaker": "is_buyer_maker",
+}
+
+# Optimal dtypes for Vision CSV (avoids type inference overhead)
+_VISION_DTYPES = {
+    "agg_trade_id": "int64",
+    "aggTradeId": "int64",
+    "price": "float64",
+    "quantity": "float64",
+    "qty": "float64",
+    "transact_time": "int64",
+    "timestamp": "int64",
+    "first_trade_id": "int64",  # ignored but may be present
+    "last_trade_id": "int64",   # ignored but may be present
+    "is_buyer_maker": "object",  # will convert with numpy
+    "isBuyerMaker": "object",
+}
+
+# Required output columns
+_VISION_REQUIRED = {"trade_id", "price", "qty", "ts_ms", "is_buyer_maker"}
+_VISION_OUTPUT_COLS = ["symbol", "trade_id", "price", "qty", "ts_ms", "is_buyer_maker"]
+
+# Check if pyarrow is available for faster CSV parsing
+try:
+    import pyarrow.csv as pa_csv
+    _HAS_PYARROW = True
+except ImportError:
+    _HAS_PYARROW = False
+
+
+def _convert_is_buyer_maker_numpy(series: pd.Series) -> np.ndarray:
+    """
+    Convert is_buyer_maker column to boolean using numpy (faster than pandas.isin).
+
+    Handles: True, False, "true", "True", "false", "False", 1, 0, "1", "0"
+    """
+    arr = series.values
+
+    # If already boolean, return as-is
+    if arr.dtype == np.bool_:
+        return arr
+
+    # If numeric, convert directly
+    if np.issubdtype(arr.dtype, np.number):
+        return arr.astype(np.bool_)
+
+    # String/object dtype - use numpy vectorized comparison
+    # Convert to lowercase string for comparison
+    str_arr = np.char.lower(arr.astype(str))
+    return (str_arr == 'true') | (str_arr == '1')
+
+
+def _filter_by_timestamp_numpy(
+    df: pd.DataFrame,
+    start_ms: int | None,
+    end_ms: int | None,
+) -> pd.DataFrame:
+    """
+    Filter DataFrame by timestamp range using numpy (faster than pandas boolean indexing).
+    """
+    if start_ms is None and end_ms is None:
+        return df
+
+    ts_arr = df["ts_ms"].values
+
+    if start_ms is not None and end_ms is not None:
+        mask = (ts_arr >= start_ms) & (ts_arr <= end_ms)
+    elif start_ms is not None:
+        mask = ts_arr >= start_ms
+    else:
+        mask = ts_arr <= end_ms
+
+    # Use numpy boolean indexing which is faster for large arrays
+    if mask.sum() == len(df):
+        return df
+    if mask.sum() == 0:
+        return df.iloc[:0]
+
+    return df.iloc[mask]
+
+
+def _read_csv_fast(
+    file_handle,
+    chunksize: int | None = None,
+    use_pyarrow: bool = True,
+) -> pd.DataFrame | pd.io.parsers.TextFileReader:
+    """
+    Read CSV with optimized settings.
+
+    Uses PyArrow backend if available (2-3x faster), otherwise optimized pandas.
+    """
+    # Common pandas options for speed
+    pandas_opts = {
+        "dtype": _VISION_DTYPES,
+        "na_filter": False,  # No NA handling needed, faster
+        "low_memory": False,  # Avoid mixed type warnings
+    }
+
+    if chunksize is not None:
+        pandas_opts["chunksize"] = chunksize
+
+    # Try PyArrow backend (much faster for large files)
+    if use_pyarrow and _HAS_PYARROW and chunksize is None:
+        try:
+            # PyArrow is only for full file reads, not chunked
+            text_stream = io.TextIOWrapper(file_handle, encoding='utf-8')
+            return pd.read_csv(
+                text_stream,
+                engine='pyarrow',
+                dtype_backend='numpy_nullable',
+            )
+        except Exception:
+            # Fall back to default engine
+            pass
+
+    # Use standard pandas with optimized settings
+    text_stream = io.TextIOWrapper(file_handle, encoding='utf-8', newline='')
+    return pd.read_csv(text_stream, **pandas_opts)
+
+
+def _process_vision_chunk(chunk: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    """
+    Process a chunk of Vision data: rename columns, convert types, select columns.
+
+    Optimized with numpy operations.
+    """
+    # Rename columns (in-place for speed)
+    chunk.rename(columns=_VISION_RENAME_MAP, inplace=True)
+
+    # Validate required columns
+    missing = _VISION_REQUIRED - set(chunk.columns)
+    if missing:
+        raise ValueError(f"Vision CSV missing columns: {sorted(missing)}")
+
+    # Convert is_buyer_maker using numpy (much faster than pandas.isin)
+    chunk["is_buyer_maker"] = _convert_is_buyer_maker_numpy(chunk["is_buyer_maker"])
+
+    # Add symbol column
+    chunk["symbol"] = symbol
+
+    # Select and reorder columns
+    return chunk[_VISION_OUTPUT_COLS]
+
+
 def load_vision_aggtrades_df(
     zip_path: Path,
     symbol: str,
     start_ms: int | None = None,
     end_ms: int | None = None,
 ) -> pd.DataFrame:
+    """
+    Load Vision aggTrades from a zip file into a DataFrame.
+
+    Optimized with:
+    - PyArrow CSV backend (if available)
+    - Explicit dtypes (no type inference)
+    - NumPy-based filtering and type conversion
+    """
     symbol = symbol.upper()
-    logger.info("Loading Vision aggTrades zip: %s", zip_path)
+    logger.debug("Loading Vision zip: %s", zip_path.name)
+
     with zipfile.ZipFile(zip_path) as archive:
         names = archive.namelist()
         if not names:
-            return pd.DataFrame(
-                columns=["symbol", "trade_id", "price", "qty", "ts_ms", "is_buyer_maker"]
-            )
-        with archive.open(names[0]) as file_handle:
-            text_stream = io.TextIOWrapper(file_handle)
-            df = pd.read_csv(text_stream)
+            return pd.DataFrame(columns=_VISION_OUTPUT_COLS)
 
-    rename_map = {
-        "agg_trade_id": "trade_id",
-        "aggTradeId": "trade_id",
-        "quantity": "qty",
-        "qty": "qty",
-        "transact_time": "ts_ms",
-        "timestamp": "ts_ms",
-        "is_buyer_maker": "is_buyer_maker",
-        "isBuyerMaker": "is_buyer_maker",
-    }
-    df = df.rename(columns=rename_map)
-    required = {"trade_id", "price", "qty", "ts_ms", "is_buyer_maker"}
-    missing = required - set(df.columns)
+        with archive.open(names[0]) as file_handle:
+            df = _read_csv_fast(file_handle, chunksize=None, use_pyarrow=True)
+
+    # Rename and validate columns
+    df.rename(columns=_VISION_RENAME_MAP, inplace=True)
+    missing = _VISION_REQUIRED - set(df.columns)
     if missing:
         raise ValueError(f"Vision CSV missing columns: {sorted(missing)}")
 
-    if start_ms is not None:
-        df = df[df["ts_ms"] >= start_ms]
-    if end_ms is not None:
-        df = df[df["ts_ms"] <= end_ms]
+    # Filter by timestamp (numpy-accelerated)
+    df = _filter_by_timestamp_numpy(df, start_ms, end_ms)
 
     if df.empty:
-        return pd.DataFrame(
-            columns=["symbol", "trade_id", "price", "qty", "ts_ms", "is_buyer_maker"]
-        )
+        return pd.DataFrame(columns=_VISION_OUTPUT_COLS)
 
+    # Convert is_buyer_maker using numpy
+    df["is_buyer_maker"] = _convert_is_buyer_maker_numpy(df["is_buyer_maker"])
+
+    # Add symbol and select columns
     df["symbol"] = symbol
-    if df["is_buyer_maker"].dtype == object:
-        df["is_buyer_maker"] = df["is_buyer_maker"].isin(["true", "True", True, 1, "1"])
-    df = df[["symbol", "trade_id", "price", "qty", "ts_ms", "is_buyer_maker"]]
-    return df
+    return df[_VISION_OUTPUT_COLS]
 
 
 def iter_vision_aggtrades_df(
@@ -330,44 +482,50 @@ def iter_vision_aggtrades_df(
     end_ms: int | None = None,
     chunksize: int = 500_000,
 ):
+    """
+    Stream Vision aggTrades from a zip file in chunks.
+
+    Optimized with:
+    - Explicit dtypes (no type inference per chunk)
+    - NumPy-based filtering and type conversion
+    - Larger default chunksize for better throughput
+
+    Yields:
+        pd.DataFrame chunks with columns: symbol, trade_id, price, qty, ts_ms, is_buyer_maker
+    """
     symbol = symbol.upper()
-    logger.info("Streaming Vision aggTrades zip: %s", zip_path)
+    logger.debug("Streaming Vision zip: %s (chunksize=%d)", zip_path.name, chunksize)
+
     with zipfile.ZipFile(zip_path) as archive:
         names = archive.namelist()
         if not names:
             return
+
         with archive.open(names[0]) as file_handle:
-            text_stream = io.TextIOWrapper(file_handle)
-            for chunk in pd.read_csv(text_stream, chunksize=chunksize):
-                rename_map = {
-                    "agg_trade_id": "trade_id",
-                    "aggTradeId": "trade_id",
-                    "quantity": "qty",
-                    "qty": "qty",
-                    "transact_time": "ts_ms",
-                    "timestamp": "ts_ms",
-                    "is_buyer_maker": "is_buyer_maker",
-                    "isBuyerMaker": "is_buyer_maker",
-                }
-                chunk = chunk.rename(columns=rename_map)
-                required = {"trade_id", "price", "qty", "ts_ms", "is_buyer_maker"}
-                missing = required - set(chunk.columns)
+            # Use chunked reader with optimized settings
+            reader = _read_csv_fast(file_handle, chunksize=chunksize, use_pyarrow=False)
+
+            for chunk in reader:
+                # Rename columns (once per chunk, in-place)
+                chunk.rename(columns=_VISION_RENAME_MAP, inplace=True)
+
+                # Validate (only on first chunk would be ideal, but keep for safety)
+                missing = _VISION_REQUIRED - set(chunk.columns)
                 if missing:
                     raise ValueError(f"Vision CSV missing columns: {sorted(missing)}")
-                if start_ms is not None:
-                    chunk = chunk[chunk["ts_ms"] >= start_ms]
-                if end_ms is not None:
-                    chunk = chunk[chunk["ts_ms"] <= end_ms]
-                if chunk.empty:
-                    continue
+
+                # Filter by timestamp using numpy (faster than pandas)
+                if start_ms is not None or end_ms is not None:
+                    chunk = _filter_by_timestamp_numpy(chunk, start_ms, end_ms)
+                    if chunk.empty:
+                        continue
+
+                # Convert is_buyer_maker using numpy
+                chunk["is_buyer_maker"] = _convert_is_buyer_maker_numpy(chunk["is_buyer_maker"])
+
+                # Add symbol and yield selected columns
                 chunk["symbol"] = symbol
-                if chunk["is_buyer_maker"].dtype == object:
-                    chunk["is_buyer_maker"] = chunk["is_buyer_maker"].isin(
-                        ["true", "True", True, 1, "1"]
-                    )
-                yield chunk[
-                    ["symbol", "trade_id", "price", "qty", "ts_ms", "is_buyer_maker"]
-                ]
+                yield chunk[_VISION_OUTPUT_COLS]
 
 
 def vision_day_available(date_value: date, now: datetime | None = None) -> bool:

@@ -4,6 +4,8 @@ duckdb
 pydantic
 httpx
 pandas
+numpy
+pyarrow
 python-dotenv
 binance-common
 binance-sdk-derivatives-trading-usds-futures
