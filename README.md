@@ -16,8 +16,8 @@ docker build -t binance-data-server .
 docker run -it --rm \
   -e BINANCE_API_KEY=... \
   -e BINANCE_API_SECRET=... \
-  -e SYMBOLS=SOLUSDT \
-  -e BACKFILL_START_DATE=2025-11-01 \
+  -e SYMBOLS=BTCUSDT \
+  -e BACKFILL_START_DATE=2024-01-01 \
   -v "./data:/app/data" \
   -p 8000:8000 \
   binance-data-server
