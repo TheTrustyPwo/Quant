@@ -8,7 +8,7 @@ from app.binance_client import (
     download_vision_aggtrades_day,
     download_vision_aggtrades_month,
     fetch_recent_agg_trades,
-    load_vision_aggtrades_df,
+    iter_vision_aggtrades_df,
     vision_day_available,
 )
 from app.config import VISION_DOWNLOAD_DIR
@@ -119,42 +119,58 @@ class BackfillManager:
         label: str,
     ) -> int:
         load_start = datetime.now(tz=timezone.utc)
-        df = load_vision_aggtrades_df(zip_path, symbol, start_ms=start_ms, end_ms=end_ms)
-        processed = len(df)
+        total_processed = 0
+        min_ts: int | None = None
+        max_ts: int | None = None
+        chunk_index = 0
+        for chunk in iter_vision_aggtrades_df(
+            zip_path, symbol, start_ms=start_ms, end_ms=end_ms
+        ):
+            if chunk.empty:
+                continue
+            chunk_index += 1
+            total_processed += len(chunk)
+            chunk_min = int(chunk["ts_ms"].min())
+            chunk_max = int(chunk["ts_ms"].max())
+            min_ts = chunk_min if min_ts is None else min(min_ts, chunk_min)
+            max_ts = chunk_max if max_ts is None else max(max_ts, chunk_max)
+            insert_agg_trades(chunk)
+            if chunk_index % 5 == 0:
+                logger.info(
+                    "Vision backfill progress for %s %s: %s trades",
+                    symbol,
+                    label,
+                    total_processed,
+                )
+
         logger.info(
             "Loaded %s trades from Vision zip for %s %s (load %s)",
-            processed,
+            total_processed,
             symbol,
             label,
             datetime.now(tz=timezone.utc) - load_start,
         )
-        if processed:
-            insert_start = datetime.now(tz=timezone.utc)
-            insert_agg_trades(df)
-            logger.info(
-                "Inserted %s Vision trades for %s %s (insert %s)",
-                processed,
-                symbol,
-                label,
-                datetime.now(tz=timezone.utc) - insert_start,
-            )
-        if processed and start_ms is not None and end_ms is not None:
+        if total_processed:
+            range_start = start_ms if start_ms is not None else min_ts
+            range_end = end_ms if end_ms is not None else max_ts
+            if range_start is None or range_end is None:
+                return total_processed
             agg_start = datetime.now(tz=timezone.utc)
             logger.info(
                 "Aggregating Vision range for %s %s (%s to %s)",
                 symbol,
                 label,
-                start_ms,
-                end_ms,
+                range_start,
+                range_end,
             )
-            rebuild_aggregates_from_range(symbol, start_ms, end_ms)
+            rebuild_aggregates_from_range(symbol, range_start, range_end)
             logger.info(
                 "Aggregation done for %s %s (agg %s)",
                 symbol,
                 label,
                 datetime.now(tz=timezone.utc) - agg_start,
             )
-        return processed
+        return total_processed
 
     def _backfill_days_in_month(
         self,

@@ -256,6 +256,53 @@ def load_vision_aggtrades_df(
     return df
 
 
+def iter_vision_aggtrades_df(
+    zip_path: Path,
+    symbol: str,
+    start_ms: int | None = None,
+    end_ms: int | None = None,
+    chunksize: int = 500_000,
+):
+    symbol = symbol.upper()
+    logger.info("Streaming Vision aggTrades zip: %s", zip_path)
+    with zipfile.ZipFile(zip_path) as archive:
+        names = archive.namelist()
+        if not names:
+            return
+        with archive.open(names[0]) as file_handle:
+            text_stream = io.TextIOWrapper(file_handle)
+            for chunk in pd.read_csv(text_stream, chunksize=chunksize):
+                rename_map = {
+                    "agg_trade_id": "trade_id",
+                    "aggTradeId": "trade_id",
+                    "quantity": "qty",
+                    "qty": "qty",
+                    "transact_time": "ts_ms",
+                    "timestamp": "ts_ms",
+                    "is_buyer_maker": "is_buyer_maker",
+                    "isBuyerMaker": "is_buyer_maker",
+                }
+                chunk = chunk.rename(columns=rename_map)
+                required = {"trade_id", "price", "qty", "ts_ms", "is_buyer_maker"}
+                missing = required - set(chunk.columns)
+                if missing:
+                    raise ValueError(f"Vision CSV missing columns: {sorted(missing)}")
+                if start_ms is not None:
+                    chunk = chunk[chunk["ts_ms"] >= start_ms]
+                if end_ms is not None:
+                    chunk = chunk[chunk["ts_ms"] <= end_ms]
+                if chunk.empty:
+                    continue
+                chunk["symbol"] = symbol
+                if chunk["is_buyer_maker"].dtype == object:
+                    chunk["is_buyer_maker"] = chunk["is_buyer_maker"].isin(
+                        ["true", "True", True, 1, "1"]
+                    )
+                yield chunk[
+                    ["symbol", "trade_id", "price", "qty", "ts_ms", "is_buyer_maker"]
+                ]
+
+
 def vision_day_available(date_value: date, now: datetime | None = None) -> bool:
     now = now or datetime.utcnow()
     today = now.date()

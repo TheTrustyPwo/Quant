@@ -21,10 +21,10 @@ DUCKDB_PATH = os.environ.get("DUCKDB_PATH", "data/market_data.duckdb")
 VISION_DOWNLOAD_DIR = os.environ.get("VISION_DOWNLOAD_DIR", "data/vision")
 SYMBOLS = [
     symbol.strip().upper()
-    for symbol in os.environ.get("SYMBOLS", "SOLUSDT").split(",")
+    for symbol in os.environ.get("SYMBOLS", "BTCUSDT").split(",")
     if symbol.strip()
 ]
-BACKFILL_START_DATE = os.environ.get("BACKFILL_START_DATE", "2025-11-01")
+BACKFILL_START_DATE = os.environ.get("BACKFILL_START_DATE", "2024-01-01")
 
 
 def _parse_backfill_start_ms(value: str) -> int:

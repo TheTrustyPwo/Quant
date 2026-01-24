@@ -11,7 +11,7 @@ docker build -t binance-data-server .
 docker run -it --rm \
   -e BINANCE_API_KEY=... \
   -e BINANCE_API_SECRET=... \
-  -e SYMBOLS=SOLUSDT \
+  -e SYMBOLS=BTCUSDT \
   -e BACKFILL_START_DATE=2025-11-01 \
   -e LOG_LEVEL=INFO \
   -e LOG_COLOR=1 \
@@ -29,16 +29,16 @@ Data is persisted in `data/` (DuckDB + Vision downloads) when the volume is moun
 # trigger a backfill
 curl -X POST "http://localhost:8000/backfill/aggtrades" \
   -H "Content-Type: application/json" \
-  -d '{"symbol": "SOLUSDT", "start_ms": 1704067200000, "end_ms": 1704153600000}'
+  -d '{"symbol": "BTCUSDT", "start_ms": 1704067200000, "end_ms": 1704153600000}'
 
 # candles (interval can be 1m, 5m, 1h, 1d, or N minutes)
-curl "http://localhost:8000/candles?symbol=SOLUSDT&start_ms=1704067200000&end_ms=1704153600000&interval=5m"
+curl "http://localhost:8000/candles?symbol=BTCUSDT&start_ms=1704067200000&end_ms=1704153600000&interval=5m"
 
 # CVD
-curl "http://localhost:8000/cvd?symbol=SOLUSDT&start_ms=1704067200000&end_ms=1704153600000&interval=1h"
+curl "http://localhost:8000/cvd?symbol=BTCUSDT&start_ms=1704067200000&end_ms=1704153600000&interval=1h"
 
 # fixed-range volume profile
-curl "http://localhost:8000/frvp?symbol=SOLUSDT&start_ms=1704067200000&end_ms=1704153600000&bucket_size=0.01"
+curl "http://localhost:8000/frvp?symbol=BTCUSDT&start_ms=1704067200000&end_ms=1704153600000&bucket_size=0.01"
 ```
 
 ## WebSocket API
@@ -46,7 +46,7 @@ curl "http://localhost:8000/frvp?symbol=SOLUSDT&start_ms=1704067200000&end_ms=17
 `ws://localhost:8000/ws/market`
 
 ```json
-{ "type": "subscribe", "symbol": "SOLUSDT", "timeframe": "1m", "streams": ["price", "cvd"], "snapshot_limit": 200 }
+{ "type": "subscribe", "symbol": "BTCUSDT", "timeframe": "1m", "streams": ["price", "cvd"], "snapshot_limit": 200 }
 ```
 
 ## Web client
@@ -62,13 +62,13 @@ Open `http://localhost:5173` and connect to `ws://localhost:8000/ws/market`.
 
 ```bash
 # Requires mplfinance in your local environment
-python scripts/plot_5m.py --base-url http://localhost:8000 --symbol SOLUSDT --interval 5m --hours 6
+python scripts/plot_5m.py --base-url http://localhost:8000 --symbol BTCUSDT --interval 5m --hours 6
 ```
 
 ## Configuration
 
 - `BACKFILL_START_DATE` (UTC, `YYYY-MM-DD`)
-- `SYMBOLS` (comma-separated list, defaults to `SOLUSDT`)
+- `SYMBOLS` (comma-separated list, defaults to `BTCUSDT`)
 - `DUCKDB_PATH` and `VISION_DOWNLOAD_DIR` for storage locations
 - `BINANCE_WS_STREAM_BASE` if you need a custom stream base URL
 - `REST_SLEEP_SEC`, `REST_MAX_RETRIES`, `REST_BACKOFF_SEC` for REST backfill throttling
