@@ -12,10 +12,31 @@ from app.binance_client import (
     vision_day_available,
 )
 from app.config import VISION_DOWNLOAD_DIR
-from app.db import insert_agg_trades
+from app.db import checkpoint_db, insert_agg_trades
 from app.ingest import rebuild_aggregates_from_range, store_trades_and_update_aggregates_sql
 
 logger = logging.getLogger(__name__)
+
+
+def _format_number(n: int | float) -> str:
+    """Format a number with K/M suffixes for readability."""
+    if abs(n) >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if abs(n) >= 1_000:
+        return f"{n/1_000:.1f}K"
+    return str(int(n))
+
+
+def _format_duration(td: timedelta) -> str:
+    """Format a timedelta for display."""
+    total_secs = int(td.total_seconds())
+    if total_secs < 60:
+        return f"{total_secs}s"
+    mins, secs = divmod(total_secs, 60)
+    if mins < 60:
+        return f"{mins}m {secs}s"
+    hours, mins = divmod(mins, 60)
+    return f"{hours}h {mins}m"
 
 class BackfillManager:
     def __init__(self) -> None:
@@ -25,11 +46,23 @@ class BackfillManager:
         if end_ms < start_ms:
             raise ValueError("end_ms must be >= start_ms")
         symbol = symbol.upper()
-        logger.info("Backfilling %s from %s to %s", symbol, start_ms, end_ms)
+
         start_date = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc).date()
         end_date = datetime.fromtimestamp(end_ms / 1000, tz=timezone.utc).date()
+        total_days = (end_date - start_date).days + 1
+
+        logger.info(
+            "%s | Backfill starting: %s to %s (%d days)",
+            symbol,
+            start_date.isoformat(),
+            end_date.isoformat(),
+            total_days,
+        )
+
         today = datetime.now(tz=timezone.utc).date()
         current_month_start = date(today.year, today.month, 1)
+        total_processed = 0
+        backfill_start = datetime.now(tz=timezone.utc)
 
         month_cursor = date(start_date.year, start_date.month, 1)
         while month_cursor <= end_date:
@@ -41,32 +74,43 @@ class BackfillManager:
             range_start = max(start_ms, month_start_ms)
             range_end = min(end_ms, month_end_ms)
 
+            month_label = f"{month_cursor.year}-{month_cursor.month:02d}"
+
             if month_cursor < current_month_start:
-                logger.info("Using Vision monthly backfill for %s %s-%02d", symbol, month_cursor.year, month_cursor.month)
+                logger.info("%s | Processing month %s (Vision monthly)", symbol, month_label)
                 try:
                     processed = self.backfill_month_from_vision(
                         symbol, month_cursor.year, month_cursor.month, range_start, range_end
                     )
+                    total_processed += processed
                     logger.info(
-                        "Vision monthly backfill loaded %s trades for %s %s-%02d",
-                        processed,
+                        "%s | Month %s complete: %s trades",
                         symbol,
-                        month_cursor.year,
-                        month_cursor.month,
+                        month_label,
+                        _format_number(processed),
                     )
-                except Exception:
+                except Exception as e:
                     logger.warning(
-                        "Monthly Vision backfill failed for %s %s-%02d, falling back to daily",
+                        "%s | Monthly Vision failed for %s (%s), using daily backfill",
                         symbol,
-                        month_cursor.year,
-                        month_cursor.month,
+                        month_label,
+                        type(e).__name__,
                     )
-                    self._backfill_days_in_month(symbol, range_start, range_end, month_cursor, month_end_date)
+                    processed = self._backfill_days_in_month(symbol, range_start, range_end, month_cursor, month_end_date)
+                    total_processed += processed
             else:
-                self._backfill_days_in_month(symbol, range_start, range_end, month_cursor, month_end_date)
+                processed = self._backfill_days_in_month(symbol, range_start, range_end, month_cursor, month_end_date)
+                total_processed += processed
 
             month_cursor = next_month
-        logger.info("Backfill complete for %s", symbol)
+
+        elapsed = datetime.now(tz=timezone.utc) - backfill_start
+        logger.info(
+            "%s | Backfill complete: %s trades in %s",
+            symbol,
+            _format_number(total_processed),
+            _format_duration(elapsed),
+        )
 
     def backfill_day_from_vision(
         self,
@@ -123,6 +167,7 @@ class BackfillManager:
         min_ts: int | None = None
         max_ts: int | None = None
         chunk_index = 0
+
         for chunk in iter_vision_aggtrades_df(
             zip_path, symbol, start_ms=start_ms, end_ms=end_ms
         ):
@@ -136,40 +181,43 @@ class BackfillManager:
             max_ts = chunk_max if max_ts is None else max(max_ts, chunk_max)
             insert_agg_trades(chunk)
             if chunk_index % 5 == 0:
-                logger.info(
-                    "Vision backfill progress for %s %s: %s trades",
+                logger.debug(
+                    "%s | Vision %s: %s trades loaded...",
                     symbol,
                     label,
-                    total_processed,
+                    _format_number(total_processed),
                 )
+                checkpoint_db()
 
+        load_elapsed = datetime.now(tz=timezone.utc) - load_start
         logger.info(
-            "Loaded %s trades from Vision zip for %s %s (load %s)",
-            total_processed,
+            "%s | Vision %s loaded: %s trades in %s",
             symbol,
             label,
-            datetime.now(tz=timezone.utc) - load_start,
+            _format_number(total_processed),
+            _format_duration(load_elapsed),
         )
+
+        if total_processed:
+            checkpoint_db()
+
         if total_processed:
             range_start = start_ms if start_ms is not None else min_ts
             range_end = end_ms if end_ms is not None else max_ts
             if range_start is None or range_end is None:
                 return total_processed
+
             agg_start = datetime.now(tz=timezone.utc)
-            logger.info(
-                "Aggregating Vision range for %s %s (%s to %s)",
-                symbol,
-                label,
-                range_start,
-                range_end,
-            )
+            logger.debug("%s | Aggregating candles for %s...", symbol, label)
             rebuild_aggregates_from_range(symbol, range_start, range_end)
-            logger.info(
-                "Aggregation done for %s %s (agg %s)",
+            agg_elapsed = datetime.now(tz=timezone.utc) - agg_start
+            logger.debug(
+                "%s | Aggregation for %s complete in %s",
                 symbol,
                 label,
-                datetime.now(tz=timezone.utc) - agg_start,
+                _format_duration(agg_elapsed),
             )
+
         return total_processed
 
     def _backfill_days_in_month(
@@ -179,56 +227,64 @@ class BackfillManager:
         range_end: int,
         month_start: date,
         month_end: date,
-    ) -> None:
+    ) -> int:
         current = max(month_start, datetime.fromtimestamp(range_start / 1000, tz=timezone.utc).date())
         last = min(month_end, datetime.fromtimestamp(range_end / 1000, tz=timezone.utc).date())
+        total_days = (last - current).days + 1
+        days_done = 0
+        total_processed = 0
+
         while current <= last:
             day_start = datetime.combine(current, datetime.min.time(), tzinfo=timezone.utc)
             day_start_ms = int(day_start.timestamp() * 1000)
             day_end_ms = day_start_ms + 86_400_000 - 1
             day_range_start = max(range_start, day_start_ms)
             day_range_end = min(range_end, day_end_ms)
+            days_done += 1
+            day_label = current.isoformat()
+
             if vision_day_available(current):
-                logger.info("Using Vision daily backfill for %s %s", symbol, current.isoformat())
+                logger.debug(
+                    "%s | Day %d/%d: %s (Vision daily)",
+                    symbol,
+                    days_done,
+                    total_days,
+                    day_label,
+                )
                 processed = self.backfill_day_from_vision(
                     symbol, current, day_range_start, day_range_end
                 )
-                logger.info(
-                    "Vision daily backfill loaded %s trades for %s %s",
-                    processed,
-                    symbol,
-                    current.isoformat(),
-                )
+                total_processed += processed
             else:
-                logger.info("Using REST backfill for %s %s", symbol, current.isoformat())
+                logger.info(
+                    "%s | Day %d/%d: %s (REST API)",
+                    symbol,
+                    days_done,
+                    total_days,
+                    day_label,
+                )
                 rest_start = datetime.now(tz=timezone.utc)
                 trades = fetch_recent_agg_trades(
                     symbol, day_range_start, day_range_end, show_progress=True
                 )
                 if trades:
-                    logger.info(
-                        "REST backfill fetched %s trades for %s %s (fetch %s)",
-                        len(trades),
-                        symbol,
-                        current.isoformat(),
-                        datetime.now(tz=timezone.utc) - rest_start,
-                    )
+                    fetch_elapsed = datetime.now(tz=timezone.utc) - rest_start
                     filtered = [t for t in trades if day_range_start <= t.ts_ms <= day_range_end]
-                    agg_start = datetime.now(tz=timezone.utc)
                     store_trades_and_update_aggregates_sql(
                         symbol, filtered, day_range_start, day_range_end
                     )
-                    logger.info(
-                        "REST backfill aggregated %s trades for %s %s (agg %s)",
-                        len(filtered),
+                    total_processed += len(filtered)
+                    logger.debug(
+                        "%s | REST %s: %s trades in %s",
                         symbol,
-                        current.isoformat(),
-                        datetime.now(tz=timezone.utc) - agg_start,
+                        day_label,
+                        _format_number(len(filtered)),
+                        _format_duration(fetch_elapsed),
                     )
                 else:
-                    logger.info(
-                        "REST backfill returned no trades for %s %s",
-                        symbol,
-                        current.isoformat(),
-                    )
+                    logger.debug("%s | REST %s: no trades", symbol, day_label)
+
+            checkpoint_db()
             current += timedelta(days=1)
+
+        return total_processed

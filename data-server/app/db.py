@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 import threading
-from typing import Iterable
+import time
+from contextlib import contextmanager
+from typing import Iterable, Generator
 
 import duckdb
 import pandas as pd
@@ -9,83 +12,141 @@ import pandas as pd
 from app.config import DUCKDB_PATH
 from app.models import AggTrade
 
-_THREAD_LOCAL = threading.local()
-_LOCK = threading.Lock()
+logger = logging.getLogger(__name__)
+
+_MAIN_CONN: duckdb.DuckDBPyConnection | None = None
+_WRITE_LOCK = threading.Lock()
+_INIT_LOCK = threading.Lock()
+_SCHEMA_INITIALIZED = False
+
+# Timeout settings
+LOCK_TIMEOUT_SEC = 30.0
+QUERY_TIMEOUT_MS = 60000
+
+
+def _get_main_connection() -> duckdb.DuckDBPyConnection:
+    """Get or create the main shared connection (used for writes)."""
+    global _MAIN_CONN, _SCHEMA_INITIALIZED
+    if _MAIN_CONN is None:
+        with _INIT_LOCK:
+            if _MAIN_CONN is None:
+                _MAIN_CONN = duckdb.connect(DUCKDB_PATH)
+                _MAIN_CONN.execute("SET threads = 4")
+                _MAIN_CONN.execute("SET memory_limit = '2GB'")
+    if not _SCHEMA_INITIALIZED:
+        with _INIT_LOCK:
+            if not _SCHEMA_INITIALIZED:
+                _init_schema(_MAIN_CONN)
+                _SCHEMA_INITIALIZED = True
+    return _MAIN_CONN
 
 
 def get_connection() -> duckdb.DuckDBPyConnection:
-    conn = getattr(_THREAD_LOCAL, "conn", None)
-    if conn is None:
-        conn = duckdb.connect(DUCKDB_PATH)
-        try:
-            conn.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
-        except Exception:
-            pass
-        _THREAD_LOCAL.conn = conn
-        _init_schema(conn)
-    return conn
+    """Get a connection for the current operation."""
+    return _get_main_connection()
+
+
+@contextmanager
+def _write_lock(timeout: float = LOCK_TIMEOUT_SEC) -> Generator[None, None, None]:
+    """Acquire write lock with timeout to prevent deadlocks."""
+    acquired = _WRITE_LOCK.acquire(timeout=timeout)
+    if not acquired:
+        raise TimeoutError(f"Could not acquire database write lock within {timeout}s")
+    try:
+        yield
+    finally:
+        _WRITE_LOCK.release()
+
+
+@contextmanager
+def read_connection() -> Generator[duckdb.DuckDBPyConnection, None, None]:
+    """Get a read-only connection that doesn't require the write lock."""
+    conn = _get_main_connection()
+    yield conn
 
 
 def _init_schema(conn: duckdb.DuckDBPyConnection) -> None:
-    with _LOCK:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS agg_trades (
-                symbol TEXT NOT NULL,
-                trade_id BIGINT NOT NULL,
-                price DOUBLE NOT NULL,
-                qty DOUBLE NOT NULL,
-                ts_ms BIGINT NOT NULL,
-                is_buyer_maker BOOLEAN NOT NULL,
-                PRIMARY KEY (symbol, trade_id)
-            );
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS candles_1m (
-                symbol TEXT NOT NULL,
-                minute_ts BIGINT NOT NULL,
-                open DOUBLE NOT NULL,
-                high DOUBLE NOT NULL,
-                low DOUBLE NOT NULL,
-                close DOUBLE NOT NULL,
-                volume DOUBLE NOT NULL,
-                PRIMARY KEY (symbol, minute_ts)
-            );
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS cvd_1m (
-                symbol TEXT NOT NULL,
-                minute_ts BIGINT NOT NULL,
-                open DOUBLE NOT NULL,
-                high DOUBLE NOT NULL,
-                low DOUBLE NOT NULL,
-                close DOUBLE NOT NULL,
-                PRIMARY KEY (symbol, minute_ts)
-            );
-            """
-        )
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS cvd_state (
-                symbol TEXT PRIMARY KEY,
-                last_cvd DOUBLE NOT NULL,
-                last_ts_ms BIGINT NOT NULL
-            );
-            """
-        )
+    """Initialize database schema. Called once at startup."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS agg_trades (
+            symbol TEXT NOT NULL,
+            trade_id BIGINT NOT NULL,
+            price DOUBLE NOT NULL,
+            qty DOUBLE NOT NULL,
+            ts_ms BIGINT NOT NULL,
+            is_buyer_maker BOOLEAN NOT NULL,
+            PRIMARY KEY (symbol, trade_id)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS candles_1m (
+            symbol TEXT NOT NULL,
+            minute_ts BIGINT NOT NULL,
+            open DOUBLE NOT NULL,
+            high DOUBLE NOT NULL,
+            low DOUBLE NOT NULL,
+            close DOUBLE NOT NULL,
+            volume DOUBLE NOT NULL,
+            PRIMARY KEY (symbol, minute_ts)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cvd_1m (
+            symbol TEXT NOT NULL,
+            minute_ts BIGINT NOT NULL,
+            open DOUBLE NOT NULL,
+            high DOUBLE NOT NULL,
+            low DOUBLE NOT NULL,
+            close DOUBLE NOT NULL,
+            PRIMARY KEY (symbol, minute_ts)
+        );
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cvd_state (
+            symbol TEXT PRIMARY KEY,
+            last_cvd DOUBLE NOT NULL,
+            last_ts_ms BIGINT NOT NULL
+        );
+        """
+    )
+    # Create indexes for better query performance
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_agg_trades_ts ON agg_trades(symbol, ts_ms)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_candles_ts ON candles_1m(symbol, minute_ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_cvd_ts ON cvd_1m(symbol, minute_ts)")
 
 
 def init_db(conn: duckdb.DuckDBPyConnection | None = None) -> None:
+    """Initialize the database schema."""
     if conn is None:
         conn = get_connection()
-    _init_schema(conn)
+    global _SCHEMA_INITIALIZED
+    with _INIT_LOCK:
+        _init_schema(conn)
+        _SCHEMA_INITIALIZED = True
+
+
+def checkpoint_db() -> None:
+    """Force a checkpoint to persist WAL to disk."""
+    try:
+        with _write_lock(timeout=10.0):
+            conn = get_connection()
+            try:
+                conn.execute("CHECKPOINT")
+            except duckdb.TransactionException:
+                conn.execute("FORCE CHECKPOINT")
+    except TimeoutError:
+        logger.warning("Checkpoint skipped - could not acquire lock")
 
 
 def insert_agg_trades(trades: list[AggTrade] | pd.DataFrame) -> int:
+    """Insert aggregated trades into the database."""
     if trades is None:
         return 0
     if isinstance(trades, pd.DataFrame):
@@ -105,21 +166,25 @@ def insert_agg_trades(trades: list[AggTrade] | pd.DataFrame) -> int:
         )
     if df.empty:
         return 0
-    conn = get_connection()
-    with _LOCK:
+
+    with _write_lock():
+        conn = get_connection()
         conn.register("df_trades", df)
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO agg_trades
-            SELECT symbol, trade_id, price, qty, ts_ms, is_buyer_maker
-            FROM df_trades
-            """
-        )
-        conn.unregister("df_trades")
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO agg_trades
+                SELECT symbol, trade_id, price, qty, ts_ms, is_buyer_maker
+                FROM df_trades
+                """
+            )
+        finally:
+            conn.unregister("df_trades")
     return len(df)
 
 
 def upsert_candle_1m(rows: Iterable[tuple[str, int, float, float, float, float, float]]) -> None:
+    """Upsert 1-minute candles."""
     rows_list = list(rows)
     if not rows_list:
         return
@@ -127,42 +192,48 @@ def upsert_candle_1m(rows: Iterable[tuple[str, int, float, float, float, float, 
         rows_list,
         columns=["symbol", "minute_ts", "open", "high", "low", "close", "volume"],
     )
-    conn = get_connection()
-    with _LOCK:
+    with _write_lock():
+        conn = get_connection()
         conn.register("df_candles", df)
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO candles_1m
-            SELECT symbol, minute_ts, open, high, low, close, volume
-            FROM df_candles
-            """
-        )
-        conn.unregister("df_candles")
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO candles_1m
+                SELECT symbol, minute_ts, open, high, low, close, volume
+                FROM df_candles
+                """
+            )
+        finally:
+            conn.unregister("df_candles")
 
 
 def upsert_cvd_1m(rows: Iterable[tuple[str, int, float, float, float, float]]) -> None:
+    """Upsert 1-minute CVD candles."""
     rows_list = list(rows)
     if not rows_list:
         return
     df = pd.DataFrame(
         rows_list, columns=["symbol", "minute_ts", "open", "high", "low", "close"]
     )
-    conn = get_connection()
-    with _LOCK:
+    with _write_lock():
+        conn = get_connection()
         conn.register("df_cvd", df)
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO cvd_1m
-            SELECT symbol, minute_ts, open, high, low, close
-            FROM df_cvd
-            """
-        )
-        conn.unregister("df_cvd")
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO cvd_1m
+                SELECT symbol, minute_ts, open, high, low, close
+                FROM df_cvd
+                """
+            )
+        finally:
+            conn.unregister("df_cvd")
 
 
 def upsert_candles_from_agg_trades(symbol: str, start_ms: int, end_ms: int) -> None:
-    conn = get_connection()
-    with _LOCK:
+    """Build and upsert 1m candles from raw aggregated trades."""
+    with _write_lock():
+        conn = get_connection()
         conn.execute(
             """
             INSERT OR REPLACE INTO candles_1m
@@ -176,16 +247,8 @@ def upsert_candles_from_agg_trades(symbol: str, start_ms: int, end_ms: int) -> N
                     min(price) AS low,
                     arg_max(price, struct_pack(ts_ms := ts_ms, trade_id := trade_id)) AS close,
                     sum(qty) AS volume
-                FROM (
-                    SELECT
-                        symbol,
-                        price,
-                        qty,
-                        ts_ms,
-                        trade_id
-                    FROM agg_trades
-                    WHERE symbol = ? AND ts_ms BETWEEN ? AND ?
-                ) t
+                FROM agg_trades
+                WHERE symbol = ? AND ts_ms BETWEEN ? AND ?
                 GROUP BY symbol, minute_ts
             ) agg;
             """,
@@ -196,8 +259,9 @@ def upsert_candles_from_agg_trades(symbol: str, start_ms: int, end_ms: int) -> N
 def upsert_cvd_from_agg_trades(
     symbol: str, start_ms: int, end_ms: int, base_cvd: float
 ) -> tuple[float | None, int | None]:
-    conn = get_connection()
-    with _LOCK:
+    """Build and upsert 1m CVD candles from raw aggregated trades."""
+    with _write_lock():
+        conn = get_connection()
         row = conn.execute(
             """
             SELECT
@@ -251,8 +315,8 @@ def upsert_cvd_from_agg_trades(
 
 
 def get_agg_trades(symbol: str, start_ms: int, end_ms: int) -> list[AggTrade]:
-    conn = get_connection()
-    with _LOCK:
+    """Retrieve aggregated trades for a symbol and time range."""
+    with read_connection() as conn:
         rows = conn.execute(
             """
             SELECT symbol, trade_id, price, qty, ts_ms, is_buyer_maker
@@ -276,8 +340,8 @@ def get_agg_trades(symbol: str, start_ms: int, end_ms: int) -> list[AggTrade]:
 
 
 def get_candles_1m(symbol: str, start_ms: int, end_ms: int) -> list[dict[str, object]]:
-    conn = get_connection()
-    with _LOCK:
+    """Retrieve 1-minute candles for a symbol and time range."""
+    with read_connection() as conn:
         rows = conn.execute(
             """
             SELECT symbol, minute_ts, open, high, low, close, volume
@@ -304,10 +368,10 @@ def get_candles_1m(symbol: str, start_ms: int, end_ms: int) -> list[dict[str, ob
 def get_candles(
     symbol: str, start_ms: int, end_ms: int, interval_ms: int
 ) -> list[dict[str, object]]:
+    """Retrieve candles for a symbol, time range, and interval."""
     if interval_ms <= 60000:
         return get_candles_1m(symbol, start_ms, end_ms)
-    conn = get_connection()
-    with _LOCK:
+    with read_connection() as conn:
         rows = conn.execute(
             """
             SELECT symbol, bucket_ts AS minute_ts,
@@ -349,8 +413,8 @@ def get_candles(
 
 
 def get_cvd_1m(symbol: str, start_ms: int, end_ms: int) -> list[dict[str, object]]:
-    conn = get_connection()
-    with _LOCK:
+    """Retrieve 1-minute CVD candles for a symbol and time range."""
+    with read_connection() as conn:
         rows = conn.execute(
             """
             SELECT symbol, minute_ts, open, high, low, close
@@ -374,10 +438,10 @@ def get_cvd_1m(symbol: str, start_ms: int, end_ms: int) -> list[dict[str, object
 
 
 def get_cvd(symbol: str, start_ms: int, end_ms: int, interval_ms: int) -> list[dict[str, object]]:
+    """Retrieve CVD candles for a symbol, time range, and interval."""
     if interval_ms <= 60000:
         return get_cvd_1m(symbol, start_ms, end_ms)
-    conn = get_connection()
-    with _LOCK:
+    with read_connection() as conn:
         rows = conn.execute(
             """
             SELECT symbol, bucket_ts AS minute_ts,
@@ -418,11 +482,11 @@ def get_cvd(symbol: str, start_ms: int, end_ms: int, interval_ms: int) -> list[d
 def get_recent_candles(
     symbol: str, end_ms: int, interval_ms: int, limit: int
 ) -> list[dict[str, object]]:
+    """Retrieve the most recent candles up to end_ms."""
     if limit <= 0:
         return []
     if interval_ms <= 60000:
-        conn = get_connection()
-        with _LOCK:
+        with read_connection() as conn:
             rows = conn.execute(
                 """
                 SELECT symbol, minute_ts, open, high, low, close, volume
@@ -447,8 +511,7 @@ def get_recent_candles(
             for row in rows
         ]
 
-    conn = get_connection()
-    with _LOCK:
+    with read_connection() as conn:
         rows = conn.execute(
             """
             SELECT symbol, bucket_ts AS minute_ts,
@@ -494,11 +557,11 @@ def get_recent_candles(
 def get_recent_cvd(
     symbol: str, end_ms: int, interval_ms: int, limit: int
 ) -> list[dict[str, object]]:
+    """Retrieve the most recent CVD candles up to end_ms."""
     if limit <= 0:
         return []
     if interval_ms <= 60000:
-        conn = get_connection()
-        with _LOCK:
+        with read_connection() as conn:
             rows = conn.execute(
                 """
                 SELECT symbol, minute_ts, open, high, low, close
@@ -522,8 +585,7 @@ def get_recent_cvd(
             for row in rows
         ]
 
-    conn = get_connection()
-    with _LOCK:
+    with read_connection() as conn:
         rows = conn.execute(
             """
             SELECT symbol, bucket_ts AS minute_ts,
@@ -566,10 +628,10 @@ def get_recent_cvd(
 def get_volume_profile(
     symbol: str, start_ms: int, end_ms: int, bucket_size: float
 ) -> list[dict[str, object]]:
+    """Compute volume profile (FRVP) for a symbol and time range."""
     if bucket_size <= 0:
         raise ValueError("bucket_size must be positive")
-    conn = get_connection()
-    with _LOCK:
+    with read_connection() as conn:
         rows = conn.execute(
             """
             SELECT price_bucket, sum(qty) AS volume
@@ -589,8 +651,8 @@ def get_volume_profile(
 
 
 def get_last_agg_trade_ts(symbol: str) -> int | None:
-    conn = get_connection()
-    with _LOCK:
+    """Get the timestamp of the most recent trade for a symbol."""
+    with read_connection() as conn:
         row = conn.execute(
             "SELECT MAX(ts_ms) FROM agg_trades WHERE symbol = ?",
             [symbol],
@@ -601,8 +663,8 @@ def get_last_agg_trade_ts(symbol: str) -> int | None:
 
 
 def get_agg_trades_coverage(symbol: str) -> tuple[int | None, int | None]:
-    conn = get_connection()
-    with _LOCK:
+    """Get the min and max timestamps for a symbol's trades."""
+    with read_connection() as conn:
         row = conn.execute(
             "SELECT MIN(ts_ms), MAX(ts_ms) FROM agg_trades WHERE symbol = ?",
             [symbol],
@@ -615,8 +677,8 @@ def get_agg_trades_coverage(symbol: str) -> tuple[int | None, int | None]:
 
 
 def get_cvd_state(symbol: str) -> tuple[float, int] | None:
-    conn = get_connection()
-    with _LOCK:
+    """Get the current CVD state for a symbol."""
+    with read_connection() as conn:
         row = conn.execute(
             "SELECT last_cvd, last_ts_ms FROM cvd_state WHERE symbol = ?",
             [symbol],
@@ -627,8 +689,9 @@ def get_cvd_state(symbol: str) -> tuple[float, int] | None:
 
 
 def upsert_cvd_state(symbol: str, last_cvd: float, last_ts_ms: int) -> None:
-    conn = get_connection()
-    with _LOCK:
+    """Update the CVD state for a symbol."""
+    with _write_lock():
+        conn = get_connection()
         conn.execute(
             """
             INSERT OR REPLACE INTO cvd_state (symbol, last_cvd, last_ts_ms)
@@ -639,8 +702,8 @@ def upsert_cvd_state(symbol: str, last_cvd: float, last_ts_ms: int) -> None:
 
 
 def get_latest_cvd_close_before(symbol: str, minute_ts: int) -> float | None:
-    conn = get_connection()
-    with _LOCK:
+    """Get the closing CVD value before a given timestamp."""
+    with read_connection() as conn:
         row = conn.execute(
             """
             SELECT close FROM cvd_1m

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import sys
 import time
+from datetime import datetime
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -19,32 +20,136 @@ from app import pubsub
 from app.services import MarketDataService
 from app.utils import parse_interval_to_ms
 
-class ColorFormatter(logging.Formatter):
-    _COLORS = {
-        logging.DEBUG: "\x1b[36m",
-        logging.INFO: "\x1b[32m",
-        logging.WARNING: "\x1b[33m",
-        logging.ERROR: "\x1b[31m",
-        logging.CRITICAL: "\x1b[35m",
-    }
-    _RESET = "\x1b[0m"
 
-    def __init__(self, use_color: bool) -> None:
-        super().__init__("%(asctime)s %(levelname)s %(name)s - %(message)s")
+class PrettyFormatter(logging.Formatter):
+    """Enhanced logging formatter with colors, icons, and component tags."""
+
+    # ANSI color codes
+    RESET = "\x1b[0m"
+    BOLD = "\x1b[1m"
+    DIM = "\x1b[2m"
+
+    # Colors
+    COLORS = {
+        logging.DEBUG: "\x1b[38;5;243m",     # Gray
+        logging.INFO: "\x1b[38;5;75m",       # Light blue
+        logging.WARNING: "\x1b[38;5;214m",   # Orange
+        logging.ERROR: "\x1b[38;5;196m",     # Red
+        logging.CRITICAL: "\x1b[38;5;199m",  # Magenta
+    }
+
+    # Level icons
+    ICONS = {
+        logging.DEBUG: "...",
+        logging.INFO: "-->",
+        logging.WARNING: "/!\\",
+        logging.ERROR: "[X]",
+        logging.CRITICAL: "!!!",
+    }
+
+    # Component colors for different modules
+    COMPONENT_COLORS = {
+        "app.db": "\x1b[38;5;141m",          # Purple
+        "app.ingest": "\x1b[38;5;114m",      # Green
+        "app.backfill": "\x1b[38;5;215m",    # Orange
+        "app.binance_client": "\x1b[38;5;81m",  # Cyan
+        "app.main": "\x1b[38;5;75m",         # Blue
+        "app.pubsub": "\x1b[38;5;219m",      # Pink
+        "app.services": "\x1b[38;5;228m",    # Yellow
+        "uvicorn": "\x1b[38;5;248m",         # Gray
+        "uvicorn.error": "\x1b[38;5;248m",
+        "uvicorn.access": "\x1b[38;5;248m",
+    }
+
+    # Short component names
+    COMPONENT_NAMES = {
+        "app.db": "DB",
+        "app.ingest": "INGEST",
+        "app.backfill": "BACKFILL",
+        "app.binance_client": "BINANCE",
+        "app.main": "SERVER",
+        "app.pubsub": "PUBSUB",
+        "app.services": "SERVICE",
+        "uvicorn": "UVICORN",
+        "uvicorn.error": "UVICORN",
+        "uvicorn.access": "HTTP",
+    }
+
+    def __init__(self, use_color: bool = True) -> None:
+        super().__init__()
         self._use_color = use_color
 
+    def _get_component(self, name: str) -> tuple[str, str]:
+        """Get component name and color from logger name."""
+        for key in self.COMPONENT_NAMES:
+            if name.startswith(key):
+                return self.COMPONENT_NAMES[key], self.COMPONENT_COLORS.get(key, "")
+        return name.split(".")[-1].upper()[:8], ""
+
     def format(self, record: logging.LogRecord) -> str:
-        message = super().format(record)
+        # Time formatting
+        dt = datetime.fromtimestamp(record.created)
+        time_str = dt.strftime("%H:%M:%S")
+        ms_str = f".{int(record.msecs):03d}"
+
+        # Component
+        component, comp_color = self._get_component(record.name)
+
+        # Level
+        level_color = self.COLORS.get(record.levelno, "")
+        icon = self.ICONS.get(record.levelno, "   ")
+
+        # Message
+        message = record.getMessage()
+
         if not self._use_color:
-            return message
-        color = self._COLORS.get(record.levelno, "")
-        return f"{color}{message}{self._RESET}" if color else message
+            return f"{time_str}{ms_str} [{component:^8}] {icon} {message}"
+
+        # Build colored output
+        time_part = f"{self.DIM}{time_str}{self.RESET}{self.DIM}{ms_str}{self.RESET}"
+        comp_part = f"{comp_color}{self.BOLD}[{component:^8}]{self.RESET}"
+        icon_part = f"{level_color}{icon}{self.RESET}"
+        msg_part = f"{level_color}{message}{self.RESET}"
+
+        return f"{time_part} {comp_part} {icon_part} {msg_part}"
 
 
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(ColorFormatter(LOG_COLOR))
-logging.basicConfig(level=LOG_LEVEL, handlers=[handler], force=True)
+def setup_logging() -> None:
+    """Configure logging with pretty formatting."""
+    # Remove existing handlers
+    root = logging.getLogger()
+    for h in root.handlers[:]:
+        root.removeHandler(h)
+
+    # Create handler with pretty formatter
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(PrettyFormatter(use_color=LOG_COLOR))
+
+    # Configure root logger
+    logging.basicConfig(level=LOG_LEVEL, handlers=[handler], force=True)
+
+    # Reduce noise from external libraries
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("websockets").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+
+setup_logging()
 logger = logging.getLogger(__name__)
+
+
+def print_startup_banner() -> None:
+    """Print a startup banner with configuration info."""
+    banner = """
+╔══════════════════════════════════════════════════════════════╗
+║         Binance USD-M Market Data Server                     ║
+╚══════════════════════════════════════════════════════════════╝"""
+    print(banner)
+    logger.info("Symbols: %s", ", ".join(SYMBOLS))
+    logger.info("Backfill start: %s", BACKFILL_START_MS)
+    logger.info("Log level: %s", LOG_LEVEL)
+
 
 app = FastAPI(title="Binance USD-M Market Data Server")
 app.add_middleware(
@@ -67,22 +172,43 @@ class BackfillRequest(BaseModel):
 
 @app.on_event("startup")
 async def on_startup() -> None:
+    print_startup_banner()
+    logger.info("Initializing server...")
+
+    # Ensure directories exist
     ensure_paths()
+
+    # Initialize database
+    logger.info("Initializing database...")
     init_db()
+    logger.info("Database ready")
+
+    # Set up pubsub event loop
     pubsub.set_event_loop(asyncio.get_running_loop())
+
+    # Start live ingestion for each symbol
     for symbol in SYMBOLS:
-        logger.info("Starting live ingestion for %s", symbol)
+        logger.info("Starting ingestion task for %s", symbol)
         _background_tasks.append(
             asyncio.create_task(run_live_ingest_with_backfill(symbol, BACKFILL_START_MS))
         )
 
+    logger.info("Server startup complete - %d symbol(s) active", len(SYMBOLS))
+
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    logger.info("Shutting down server...")
+
+    # Cancel all background tasks
     for task in _background_tasks:
         task.cancel()
+
     if _background_tasks:
+        logger.info("Waiting for %d task(s) to complete...", len(_background_tasks))
         await asyncio.gather(*_background_tasks, return_exceptions=True)
+
+    logger.info("Server shutdown complete")
 
 
 @app.get("/health")

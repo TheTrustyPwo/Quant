@@ -7,7 +7,7 @@ import time
 import zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncGenerator
 
 import httpx
 import pandas as pd
@@ -33,6 +33,20 @@ from app.config import (
 from app.models import AggTrade
 
 logger = logging.getLogger(__name__)
+
+# HTTP client with connection pooling for better performance
+_HTTP_CLIENT: httpx.Client | None = None
+
+
+def _get_http_client() -> httpx.Client:
+    """Get or create a shared HTTP client with connection pooling."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        _HTTP_CLIENT = httpx.Client(
+            timeout=30.0,
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+        )
+    return _HTTP_CLIENT
 
 configuration_rest_api = ConfigurationRestAPI(
     api_key=BINANCE_API_KEY,
@@ -71,17 +85,25 @@ def fetch_recent_agg_trades(
     end_ms: int,
     show_progress: bool = False,
 ) -> list[AggTrade]:
+    """Fetch aggregated trades from Binance REST API.
+
+    Uses pagination to fetch all trades in the given time range.
+    Handles rate limiting with exponential backoff.
+    """
     trades: list[AggTrade] = []
     symbol_upper = symbol.upper()
     base_url = DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL.rstrip("/")
     url = f"{base_url}/fapi/v1/aggTrades"
     current_start = start_ms
     total_ms = max(end_ms - start_ms + 1, 1)
+    client = _get_http_client()
+
     progress = tqdm(
         total=total_ms,
         unit="ms",
-        desc=f"REST backfill {symbol_upper}",
+        desc=f"REST {symbol_upper}",
         disable=not show_progress,
+        bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt}",
     )
     try:
         while current_start <= end_ms:
@@ -93,22 +115,37 @@ def fetch_recent_agg_trades(
             }
             data = None
             for attempt in range(REST_MAX_RETRIES + 1):
-                response = httpx.get(url, params=params, headers=_rest_headers(), timeout=30)
-                if response.status_code == 429:
-                    retry_after = response.headers.get("Retry-After")
-                    if retry_after and retry_after.isdigit():
-                        delay = float(retry_after)
-                    else:
+                try:
+                    response = client.get(url, params=params, headers=_rest_headers())
+                    if response.status_code == 429:
+                        retry_after = response.headers.get("Retry-After")
+                        if retry_after and retry_after.isdigit():
+                            delay = float(retry_after)
+                        else:
+                            delay = REST_BACKOFF_SEC * (2 ** attempt)
+                        logger.warning(
+                            "%s | Rate limited (429), waiting %.1fs",
+                            symbol_upper,
+                            delay,
+                        )
+                        time.sleep(delay)
+                        continue
+                    response.raise_for_status()
+                    data = response.json()
+                    break
+                except httpx.RequestError as e:
+                    if attempt < REST_MAX_RETRIES:
                         delay = REST_BACKOFF_SEC * (2 ** attempt)
-                    logger.warning(
-                        "Rate limited by Binance REST (429), retrying in %.2fs",
-                        delay,
-                    )
-                    time.sleep(delay)
-                    continue
-                response.raise_for_status()
-                data = response.json()
-                break
+                        logger.warning(
+                            "%s | Request error: %s, retrying in %.1fs",
+                            symbol_upper,
+                            type(e).__name__,
+                            delay,
+                        )
+                        time.sleep(delay)
+                    else:
+                        raise
+
             if data is None:
                 raise httpx.HTTPStatusError(
                     "Exceeded REST retries for aggTrades",
@@ -153,16 +190,32 @@ def _build_ws_url(stream: str) -> str:
     return f"{base}/ws/{stream}"
 
 
-async def stream_agg_trades(symbol: str):
+async def stream_agg_trades(symbol: str) -> AsyncGenerator[AggTrade, None]:
+    """Stream aggregated trades from Binance WebSocket.
+
+    Yields AggTrade objects as they arrive from the WebSocket stream.
+    The connection uses ping/pong to detect disconnections.
+    """
     stream = f"{symbol.lower()}@aggTrade"
     url = _build_ws_url(stream)
-    async with websockets.connect(url, ping_interval=20, ping_timeout=20) as websocket:
+    logger.debug("%s | WebSocket connecting to %s", symbol.upper(), url)
+
+    async with websockets.connect(
+        url,
+        ping_interval=20,
+        ping_timeout=20,
+        close_timeout=5,
+    ) as websocket:
+        logger.debug("%s | WebSocket connected", symbol.upper())
         while True:
             message = await websocket.recv()
             payload = json.loads(message)
             data = payload.get("data", payload)
+
+            # Skip non-trade messages
             if data.get("e") != "aggTrade":
                 continue
+
             yield AggTrade(
                 symbol=data.get("s", symbol.upper()),
                 trade_id=int(data["a"]),
@@ -174,16 +227,30 @@ async def stream_agg_trades(symbol: str):
 
 
 def _download_file(url: str, dest_path: Path) -> Path:
+    """Download a file from URL to destination path.
+
+    Uses caching - if the file already exists and has content, it will be reused.
+    """
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     if dest_path.exists() and dest_path.stat().st_size > 0:
-        logger.info("Using cached Vision file: %s", dest_path)
+        logger.debug("Using cached: %s", dest_path.name)
         return dest_path
-    logger.info("Downloading Vision file: %s", url)
-    with httpx.stream("GET", url, timeout=60) as response:
+
+    logger.debug("Downloading: %s", dest_path.name)
+    with httpx.stream("GET", url, timeout=120, follow_redirects=True) as response:
         response.raise_for_status()
+        total_size = int(response.headers.get("content-length", 0))
+        downloaded = 0
+
         with dest_path.open("wb") as handle:
-            for chunk in response.iter_bytes():
+            for chunk in response.iter_bytes(chunk_size=65536):
                 handle.write(chunk)
+                downloaded += len(chunk)
+
+        if total_size > 0:
+            size_mb = total_size / (1024 * 1024)
+            logger.debug("Downloaded: %s (%.1f MB)", dest_path.name, size_mb)
+
     return dest_path
 
 
