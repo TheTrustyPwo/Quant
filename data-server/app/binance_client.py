@@ -90,14 +90,54 @@ def fetch_recent_agg_trades(
 
     Uses pagination to fetch all trades in the given time range.
     Handles rate limiting with exponential backoff.
+
+    Note: For large datasets, consider using fetch_recent_agg_trades_df() instead
+    which returns a DataFrame directly and is much more efficient.
     """
-    trades: list[AggTrade] = []
+    df = fetch_recent_agg_trades_df(symbol, start_ms, end_ms, show_progress)
+    if df.empty:
+        return []
+    # Convert DataFrame to list of AggTrade objects
+    return [
+        AggTrade(
+            symbol=row.symbol,
+            trade_id=int(row.trade_id),
+            price=float(row.price),
+            qty=float(row.qty),
+            ts_ms=int(row.ts_ms),
+            is_buyer_maker=bool(row.is_buyer_maker),
+        )
+        for row in df.itertuples(index=False)
+    ]
+
+
+def fetch_recent_agg_trades_df(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    show_progress: bool = False,
+) -> pd.DataFrame:
+    """Fetch aggregated trades from Binance REST API as a DataFrame.
+
+    This is much more efficient than fetch_recent_agg_trades() for large datasets
+    as it avoids creating millions of Python objects.
+
+    Uses pagination to fetch all trades in the given time range.
+    Handles rate limiting with exponential backoff.
+    """
     symbol_upper = symbol.upper()
     base_url = DERIVATIVES_TRADING_USDS_FUTURES_REST_API_PROD_URL.rstrip("/")
     url = f"{base_url}/fapi/v1/aggTrades"
     current_start = start_ms
     total_ms = max(end_ms - start_ms + 1, 1)
     client = _get_http_client()
+
+    # Accumulate data directly into lists (much faster than creating objects)
+    trade_ids: list[int] = []
+    prices: list[float] = []
+    qtys: list[float] = []
+    ts_ms_list: list[int] = []
+    is_buyer_maker_list: list[bool] = []
 
     progress = tqdm(
         total=total_ms,
@@ -155,8 +195,15 @@ def fetch_recent_agg_trades(
                 )
             if not data:
                 break
+
+            # Accumulate directly into lists (no object creation)
             for item in data:
-                trades.append(_parse_rest_agg_trade(symbol_upper, item))
+                trade_ids.append(int(item.get("a") or item.get("aggTradeId") or item.get("id")))
+                prices.append(float(item.get("p") or item.get("price")))
+                qtys.append(float(item.get("q") or item.get("qty")))
+                ts_ms_list.append(int(item.get("T") or item.get("timestamp")))
+                is_buyer_maker_list.append(bool(item.get("m") if "m" in item else item.get("isBuyerMaker")))
+
             last_ts = data[-1].get("T") or data[-1].get("timestamp")
             if last_ts is None:
                 break
@@ -171,7 +218,19 @@ def fetch_recent_agg_trades(
         if not progress.disable and progress.n < total_ms:
             progress.update(total_ms - progress.n)
         progress.close()
-    return trades
+
+    if not trade_ids:
+        return pd.DataFrame(columns=["symbol", "trade_id", "price", "qty", "ts_ms", "is_buyer_maker"])
+
+    # Build DataFrame directly from lists (very fast, no Python object overhead)
+    return pd.DataFrame({
+        "symbol": symbol_upper,
+        "trade_id": np.array(trade_ids, dtype=np.int64),
+        "price": np.array(prices, dtype=np.float64),
+        "qty": np.array(qtys, dtype=np.float64),
+        "ts_ms": np.array(ts_ms_list, dtype=np.int64),
+        "is_buyer_maker": np.array(is_buyer_maker_list, dtype=np.bool_),
+    })
 
 
 def _build_ws_url(stream: str) -> str:

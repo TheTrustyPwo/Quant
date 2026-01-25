@@ -7,7 +7,7 @@ from pathlib import Path
 from app.binance_client import (
     download_vision_aggtrades_day,
     download_vision_aggtrades_month,
-    fetch_recent_agg_trades,
+    fetch_recent_agg_trades_df,
     iter_vision_aggtrades_df,
     vision_day_available,
 )
@@ -264,23 +264,68 @@ class BackfillManager:
                     day_label,
                 )
                 rest_start = datetime.now(tz=timezone.utc)
-                trades = fetch_recent_agg_trades(
+                # Use DataFrame version for efficiency (avoids creating millions of Python objects)
+                trades_df = fetch_recent_agg_trades_df(
                     symbol, day_range_start, day_range_end, show_progress=True
                 )
-                if trades:
+                if not trades_df.empty:
                     fetch_elapsed = datetime.now(tz=timezone.utc) - rest_start
-                    filtered = [t for t in trades if day_range_start <= t.ts_ms <= day_range_end]
-                    store_trades_and_update_aggregates_sql(
-                        symbol, filtered, day_range_start, day_range_end
-                    )
-                    total_processed += len(filtered)
-                    logger.debug(
-                        "%s | REST %s: %s trades in %s",
+                    # Filter by timestamp range (vectorized, very fast)
+                    mask = (trades_df["ts_ms"] >= day_range_start) & (trades_df["ts_ms"] <= day_range_end)
+                    filtered_df = trades_df[mask]
+                    num_trades = len(filtered_df)
+
+                    logger.info(
+                        "%s | REST %s: %s trades fetched in %s, inserting...",
                         symbol,
                         day_label,
-                        _format_number(len(filtered)),
+                        _format_number(num_trades),
                         _format_duration(fetch_elapsed),
                     )
+
+                    # Insert trades in chunks (like ZIP does) to avoid memory issues
+                    # and provide progress feedback
+                    CHUNK_SIZE = 500_000
+                    insert_start = datetime.now(tz=timezone.utc)
+                    for chunk_idx in range(0, num_trades, CHUNK_SIZE):
+                        chunk_df = filtered_df.iloc[chunk_idx : chunk_idx + CHUNK_SIZE]
+                        insert_agg_trades(chunk_df)
+                        chunk_num = chunk_idx // CHUNK_SIZE + 1
+                        total_chunks = (num_trades + CHUNK_SIZE - 1) // CHUNK_SIZE
+                        if total_chunks > 1:
+                            logger.info(
+                                "%s | REST %s: inserted chunk %d/%d (%s trades)",
+                                symbol,
+                                day_label,
+                                chunk_num,
+                                total_chunks,
+                                _format_number(len(chunk_df)),
+                            )
+                        # Checkpoint after each chunk (like ZIP does every 5 chunks)
+                        if chunk_num % 5 == 0 or chunk_idx + CHUNK_SIZE >= num_trades:
+                            checkpoint_db()
+
+                    insert_elapsed = datetime.now(tz=timezone.utc) - insert_start
+                    logger.info(
+                        "%s | REST %s: %s trades inserted in %s, aggregating...",
+                        symbol,
+                        day_label,
+                        _format_number(num_trades),
+                        _format_duration(insert_elapsed),
+                    )
+
+                    # Now run aggregation (can be slow for large datasets)
+                    agg_start = datetime.now(tz=timezone.utc)
+                    rebuild_aggregates_from_range(symbol, day_range_start, day_range_end)
+                    agg_elapsed = datetime.now(tz=timezone.utc) - agg_start
+                    logger.info(
+                        "%s | REST %s: aggregation complete in %s",
+                        symbol,
+                        day_label,
+                        _format_duration(agg_elapsed),
+                    )
+
+                    total_processed += num_trades
                 else:
                     logger.debug("%s | REST %s: no trades", symbol, day_label)
 

@@ -178,36 +178,17 @@ def insert_agg_trades(trades: list[AggTrade] | pd.DataFrame) -> int:
         if not trades:
             return 0
 
-        # Use numpy arrays directly (much faster than list comprehensions for large lists)
-        n = len(trades)
-
-        # Pre-allocate arrays
-        symbols = np.empty(n, dtype=object)
-        trade_ids = np.empty(n, dtype=np.int64)
-        prices = np.empty(n, dtype=np.float64)
-        qtys = np.empty(n, dtype=np.float64)
-        ts_ms_arr = np.empty(n, dtype=np.int64)
-        is_buyer_maker_arr = np.empty(n, dtype=np.bool_)
-
-        # Fill arrays (faster than list comprehension + DataFrame constructor)
-        for i, t in enumerate(trades):
-            symbols[i] = t.symbol
-            trade_ids[i] = t.trade_id
-            prices[i] = t.price
-            qtys[i] = t.qty
-            ts_ms_arr[i] = t.ts_ms
-            is_buyer_maker_arr[i] = t.is_buyer_maker
-
-        df = pd.DataFrame(
-            {
-                "symbol": symbols,
-                "trade_id": trade_ids,
-                "price": prices,
-                "qty": qtys,
-                "ts_ms": ts_ms_arr,
-                "is_buyer_maker": is_buyer_maker_arr,
-            }
+        # Use pandas from_records which is much faster than Python loops
+        # This avoids the slow per-element iteration in Python
+        df = pd.DataFrame.from_records(
+            (
+                (t.symbol, t.trade_id, t.price, t.qty, t.ts_ms, t.is_buyer_maker)
+                for t in trades
+            ),
+            columns=["symbol", "trade_id", "price", "qty", "ts_ms", "is_buyer_maker"],
         )
+        # Ensure correct dtypes for efficient insertion
+        df = df.astype(_AGG_TRADES_DTYPES)
 
     if df.empty:
         return 0
