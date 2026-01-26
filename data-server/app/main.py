@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from app.backfill import BackfillManager
 from app.config import BACKFILL_START_MS, LOG_COLOR, LOG_LEVEL, SYMBOLS, ensure_paths
-from app.db import init_db
+from app.db import checkpoint_db, init_db
 from app.ingest import run_live_ingest_with_backfill
 from app.models import Candle, Coverage, CvdCandle, VolumeProfileBucket
 from app import pubsub
@@ -207,6 +207,14 @@ async def on_shutdown() -> None:
     if _background_tasks:
         logger.info("Waiting for %d task(s) to complete...", len(_background_tasks))
         await asyncio.gather(*_background_tasks, return_exceptions=True)
+
+    # Final checkpoint to persist any uncommitted data
+    logger.info("Final database checkpoint...")
+    try:
+        checkpoint_db()
+        logger.info("Database checkpoint complete")
+    except Exception:
+        logger.exception("Failed to checkpoint database on shutdown")
 
     logger.info("Server shutdown complete")
 

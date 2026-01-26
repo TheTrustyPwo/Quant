@@ -390,4 +390,19 @@ async def run_live_ingest_with_backfill(
         logger.info("%s | Shutting down ingestion...", symbol)
         stream_task.cancel()
         await asyncio.gather(stream_task, return_exceptions=True)
+
+        # Flush any remaining trades in buffer before shutdown
+        if buffer:
+            logger.info("%s | Flushing %d remaining trades...", symbol, len(buffer))
+            try:
+                min_ts = min(t.ts_ms for t in buffer)
+                max_ts = max(t.ts_ms for t in buffer)
+                await asyncio.to_thread(
+                    store_trades_and_update_aggregates_sql, symbol, buffer, min_ts, max_ts
+                )
+                await asyncio.to_thread(checkpoint_db)
+                logger.info("%s | Buffer flushed and checkpointed", symbol)
+            except Exception:
+                logger.exception("%s | Failed to flush buffer on shutdown", symbol)
+
         raise
